@@ -23,6 +23,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "sx1262.h"
+#include "ssd1306.h"
 
 static const char *TAG = "gateway";
 
@@ -69,7 +70,19 @@ static esp_err_t button_init(void)
 static void gateway_task(void *arg)
 {
     sx1262_t radio;
+    ssd1306_t *oled = NULL;
     esp_err_t ret;
+
+    /* Inicializa OLED */
+    ret = ssd1306_init(&oled);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "OLED init falhou: %s (continuando sem display)", esp_err_to_name(ret));
+    } else {
+        ssd1306_clear(oled);
+        ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
+        ssd1306_draw_string(oled, 2, 0, "Aguardando...");
+        ssd1306_update(oled);
+    }
 
     ret = sx1262_init(&radio);
     if (ret != ESP_OK) {
@@ -80,6 +93,14 @@ static void gateway_task(void *arg)
 
     ESP_LOGI(TAG, "=== LoRa Gateway (Requester) ===");
     ESP_LOGI(TAG, "Pressione o botao PRG (GPIO0) para solicitar leitura");
+
+    if (oled) {
+        ssd1306_clear(oled);
+        ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
+        ssd1306_draw_string(oled, 2, 0, "Pressione PRG");
+        ssd1306_draw_string(oled, 3, 0, "para ler sensor");
+        ssd1306_update(oled);
+    }
 
     while (1) {
         /* Aguarda pressionamento do botão */
@@ -162,6 +183,21 @@ static void gateway_task(void *arg)
         ESP_LOGI(TAG, "    Pacote: [0x%02X 0x%02X 0x%02X 0x%02X] | RSSI: %d dBm",
                  rx_data[0], rx_data[1], rx_data[2], rx_data[3], rssi);
 
+        /* Atualiza OLED com dados recebidos */
+        if (oled) {
+            char line[22];
+            ssd1306_clear(oled);
+            ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
+            snprintf(line, sizeof(line), "LDR: %u", adc_value);
+            ssd1306_draw_string(oled, 2, 0, line);
+            snprintf(line, sizeof(line), "RSSI: %d dBm", rssi);
+            ssd1306_draw_string(oled, 3, 0, line);
+            snprintf(line, sizeof(line), "[%02X %02X %02X %02X]",
+                     rx_data[0], rx_data[1], rx_data[2], rx_data[3]);
+            ssd1306_draw_string(oled, 5, 0, line);
+            ssd1306_update(oled);
+        }
+
         /*
          * No sistema final, aqui o gateway repassaria via UART para o FPGA:
          *   UART TX → [0xAA, DATA_HIGH, DATA_LOW, CHECKSUM]
@@ -179,5 +215,5 @@ void app_main(void)
         return;
     }
 
-    xTaskCreatePinnedToCore(gateway_task, "gateway", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(gateway_task, "gateway", 8192, NULL, 5, NULL, 1);
 }
