@@ -40,6 +40,10 @@ static const char *TAG = "gateway";
 /* ── Semáforo para ISR do botão ──────────────────────────────────── */
 static SemaphoreHandle_t s_btn_sem;
 
+/**
+ * @brief ISR do botao PRG (GPIO0). Sinaliza o semaforo binario
+ *        para acordar a gateway_task a cada borda de descida.
+ */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
     BaseType_t higher_prio_woken = pdFALSE;
@@ -47,6 +51,11 @@ static void IRAM_ATTR button_isr_handler(void *arg)
     portYIELD_FROM_ISR(higher_prio_woken);
 }
 
+/**
+ * @brief Configura GPIO0 como entrada com pull-up e interrupcao
+ *        por borda de descida (botao ativo-baixo). Instala o
+ *        servico de ISR e registra button_isr_handler.
+ */
 static esp_err_t button_init(void)
 {
     gpio_config_t cfg = {
@@ -66,7 +75,18 @@ static esp_err_t button_init(void)
     return gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
 }
 
-/* ── Task principal ──────────────────────────────────────────────── */
+/**
+ * @brief Task principal do gateway LoRa.
+ *
+ * Fluxo:
+ *  1. Inicializa o display OLED SSD1306 (128x64) via I2C.
+ *  2. Inicializa o radio SX1262 via SPI (915 MHz, SF7, BW125).
+ *  3. Entra em loop aguardando o semaforo do botao PRG (GPIO0).
+ *  4. Ao pressionar, envia request [0xBB 0x01] via LoRa.
+ *  5. Aguarda resposta [0xAA, HIGH, LOW, XOR] com timeout de 5s.
+ *  6. Valida header, tamanho e checksum XOR do pacote recebido.
+ *  7. Exibe valor ADC do sensor (LDR) e RSSI no log e no OLED.
+ */
 static void gateway_task(void *arg)
 {
     sx1262_t radio;
@@ -205,6 +225,13 @@ static void gateway_task(void *arg)
     }
 }
 
+/**
+ * @brief Ponto de entrada da aplicacao.
+ *
+ * Cria o semaforo binario para sincronizacao ISR→task,
+ * inicializa o botao PRG e lanca a gateway_task no core 1
+ * com 8 KB de stack (necessario para framebuffer OLED + SPI).
+ */
 void app_main(void)
 {
     s_btn_sem = xSemaphoreCreateBinary();

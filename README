@@ -1,1 +1,88 @@
-# digital_communication_lab_request
+# Digital Communication Lab - LoRa Request Node
+
+Projeto de laboratorio de comunicacoes digitais utilizando dois modulos
+Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) para comunicacao LoRa
+request/response com leitura remota de sensor.
+
+## Visao geral
+
+Este firmware implementa o **no requisitante (gateway)** do sistema.
+Ao pressionar o botao PRG (GPIO0), o gateway envia um pacote LoRa de
+requisicao e aguarda a resposta do no sensor com o valor ADC de um LDR.
+O resultado e exibido no display OLED integrado e no log serial.
+
+## Protocolo
+
+| Direcao           | Formato                              |
+|--------------------|--------------------------------------|
+| Request (gateway)  | `[0xBB, 0x01]`                      |
+| Response (sensor)  | `[0xAA, DATA_HIGH, DATA_LOW, XOR]`  |
+
+- **XOR**: checksum = `DATA_HIGH ^ DATA_LOW`
+- **Valor ADC**: 12 bits, `(DATA_HIGH << 8) | DATA_LOW`
+
+## Hardware
+
+- **Placa**: Heltec WiFi LoRa 32 V3 / V3.1 (ESP32-S3)
+- **Radio LoRa**: SX1262 via SPI (915 MHz, SF7, BW125 kHz, CR4/5, +22 dBm)
+- **Display OLED**: SSD1306 128x64 via I2C (0x3C)
+- **Botao**: PRG / GPIO0 (ativo-baixo)
+
+### Pinagem
+
+| Funcao       | GPIO |
+|--------------|------|
+| SX1262 MOSI  | 10   |
+| SX1262 MISO  | 11   |
+| SX1262 SCK   | 9    |
+| SX1262 CS    | 8    |
+| SX1262 RST   | 12   |
+| SX1262 BUSY  | 13   |
+| SX1262 DIO1  | 14   |
+| OLED SDA     | 17   |
+| OLED SCL     | 18   |
+| OLED RST     | 21   |
+| OLED Vext    | 36   |
+| Botao PRG    | 0    |
+
+## Estrutura do projeto
+
+```
+digital_communication_lab_request/
+├── main/
+│   ├── main.c              # Logica do gateway (botao, LoRa, OLED)
+│   └── CMakeLists.txt
+├── components/
+│   ├── sx1262/              # Driver SX1262 LoRa (SPI)
+│   │   ├── sx1262.c
+│   │   └── include/sx1262.h
+│   └── ssd1306/             # Driver SSD1306 OLED (I2C)
+│       ├── ssd1306.c
+│       └── include/ssd1306.h
+├── CMakeLists.txt
+├── sdkconfig.defaults
+└── README
+```
+
+## Requisitos
+
+- **ESP-IDF v6.0**
+- **Target**: esp32s3
+
+## Build e flash
+
+```bash
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COMx flash monitor
+```
+
+## Funcionamento
+
+1. Ao ligar, o gateway inicializa o OLED e o radio LoRa.
+2. O display mostra "Pressione PRG para ler sensor".
+3. Ao pressionar o botao PRG, o gateway:
+   - Envia `[0xBB, 0x01]` via LoRa.
+   - Aguarda resposta por 5 segundos.
+   - Valida header (0xAA), tamanho (4 bytes) e checksum XOR.
+   - Exibe valor do LDR e RSSI no OLED e no log serial.
