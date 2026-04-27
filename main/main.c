@@ -1,14 +1,31 @@
 /**
- * @file main.c
+ * @file  main.c
  * @brief LoRa Gateway (Heltec #2) — Requester
  *
- * Simula o papel do FPGA: ao pressionar o botão PRG (GPIO0),
- * envia um pacote LoRa de requisição (0xBB 0x01) e aguarda
- * a resposta do nó sensor com o valor do LDR.
+ * NÓ GATEWAY DO PIPELINE END-TO-END:
  *
- * Protocolo (conforme especificação do projeto):
- *   Request: [0xBB, 0x01]
- *   Response: [0xAA, DATA_HIGH, DATA_LOW, XOR(HIGH,LOW)]
+ *   ┌──────────────┐  LoRa req   ┌──────────────┐  LoRa resp  ┌──────────────┐  UART  ┌──────┐
+ *   │  ESTE NÓ     │ ──────────> │  Sensor Node │ ──────────> │   ESTE NÓ    │ ─────> │ FPGA │
+ *   │ (requester)  │             │  + BH1750    │             │ (re-recv)    │        │ MIPS │
+ *   └──────────────┘             └──────────────┘             └──────────────┘        └──────┘
+ *           ▲                                                          │
+ *           │                                                          │
+ *           └─── botão PRG dispara request ────────────────────────────┘
+ *                (futuramente substituído por trigger automático
+ *                 em intervalo regular ou comando do FPGA via UART)
+ *
+ * Comportamento:
+ *   1. Inicializa OLED e SX1262
+ *   2. Configura GPIO0 (botão PRG) como interrupção por borda de descida
+ *   3. Aguarda pressionamento via semáforo binário (ISR → task)
+ *   4. Ao pressionar:
+ *        a. Aplica debounce de 200ms
+ *        b. Transmite [0xBB, 0x01] via LoRa
+ *        c. Entra em RX com timeout de 5s aguardando resposta
+ *        d. Valida tamanho, header e checksum XOR
+ *        e. Extrai lux (uint16) e mostra no OLED + log serial
+ *   5. Volta a aguardar próximo pressionamento
+ *
  *
  * Plataforma: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
  * Framework:  ESP-IDF v6.0
@@ -21,28 +38,38 @@
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "sx1262.h"
 #include "ssd1306.h"
 
 static const char *TAG = "gateway";
 
-/* ── Protocolo ───────────────────────────────────────────────────── */
-#define HEADER_REQUEST   0xBB
-#define CMD_READ_SENSOR  0x01
-#define HEADER_RESPONSE  0xAA
-#define RESPONSE_LEN     4
+/* ── Protocolo Request/Response ──────────────────────────────────── */
+/* Formato idêntico ao do nó sensor — protocolo agnóstico ao sensor   */
+/* físico do outro lado (LDR, BH1750, qualquer um cabe em uint16).    */
+#define HEADER_REQUEST   0xBB    /* Byte 0 do request                  */
+#define CMD_READ_SENSOR  0x01    /* Byte 1: comando "ler sensor"       */
+#define HEADER_RESPONSE  0xAA    /* Byte 0 esperado na resposta        */
+#define RESPONSE_LEN     4       /* [HEADER, HIGH, LOW, XOR]           */
 
 /* ── Hardware ────────────────────────────────────────────────────── */
-#define BUTTON_GPIO      GPIO_NUM_0   /* PRG button no Heltec V3 */
-#define RX_TIMEOUT_MS    5000         /* Timeout para resposta do sensor */
+#define BUTTON_GPIO      GPIO_NUM_0   /* Botão PRG do Heltec V3        */
+#define RX_TIMEOUT_MS    5000         /* Sensor deve responder em <5s  */
 
-/* ── Semáforo para ISR do botão ──────────────────────────────────── */
+/* ── Sincronização ISR → Task ────────────────────────────────────── */
+/* Semáforo binário: a ISR dá give() a cada borda, a task espera      */
+/* indefinidamente em take(). Evita polling do GPIO no loop principal. */
 static SemaphoreHandle_t s_btn_sem;
 
 /**
- * @brief ISR do botao PRG (GPIO0). Sinaliza o semaforo binario
- *        para acordar a gateway_task a cada borda de descida.
+ * @brief ISR do botão PRG (GPIO0).
+ *
+ * Atributo IRAM_ATTR é obrigatório: ISRs são executadas com cache de
+ * flash potencialmente desativado, então precisam estar em IRAM.
+ *
+ * O semáforo é dado de dentro da ISR via xSemaphoreGiveFromISR para
+ * acordar a task. Se o give() resultou em uma task de prioridade
+ * maior que a interrompida, portYIELD_FROM_ISR força um context
+ * switch ao retornar, ao invés de esperar o próximo tick.
  */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -52,9 +79,16 @@ static void IRAM_ATTR button_isr_handler(void *arg)
 }
 
 /**
- * @brief Configura GPIO0 como entrada com pull-up e interrupcao
- *        por borda de descida (botao ativo-baixo). Instala o
- *        servico de ISR e registra button_isr_handler.
+ * @brief Configura GPIO0 como entrada com pull-up + IRQ neg-edge.
+ *
+ * O botão PRG é ativo-baixo: pull-up interno mantém HIGH em idle,
+ * e o pressionamento força LOW. Por isso a interrupção é por borda
+ * de descida (NEGEDGE).
+ *
+ * gpio_install_isr_service(0):
+ *   - O argumento 0 indica que não queremos flags especiais (ESP_INTR_FLAG_*)
+ *   - Pode retornar ESP_ERR_INVALID_STATE se outra parte do código já
+ *     instalou o serviço — não é erro, ignoramos.
  */
 static esp_err_t button_init(void)
 {
@@ -63,7 +97,7 @@ static esp_err_t button_init(void)
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,  /* Ativo-baixo (pressionado = LOW) */
+        .intr_type    = GPIO_INTR_NEGEDGE,
     };
 
     esp_err_t ret = gpio_config(&cfg);
@@ -78,25 +112,25 @@ static esp_err_t button_init(void)
 /**
  * @brief Task principal do gateway LoRa.
  *
- * Fluxo:
- *  1. Inicializa o display OLED SSD1306 (128x64) via I2C.
- *  2. Inicializa o radio SX1262 via SPI (915 MHz, SF7, BW125).
- *  3. Entra em loop aguardando o semaforo do botao PRG (GPIO0).
- *  4. Ao pressionar, envia request [0xBB 0x01] via LoRa.
- *  5. Aguarda resposta [0xAA, HIGH, LOW, XOR] com timeout de 5s.
- *  6. Valida header, tamanho e checksum XOR do pacote recebido.
- *  7. Exibe valor ADC do sensor (LDR) e RSSI no log e no OLED.
+ * Roda no Core 1 (deixa Core 0 para o stack WiFi/BT, se ativados).
+ * Stack de 8KB acomoda o framebuffer do OLED (1KB), buffers SPI do
+ * SX1262 e variáveis locais com folga.
+ *
+ * O loop é totalmente event-driven: bloqueia em xSemaphoreTake até
+ * o botão ser pressionado. Sem polling = sem CPU desperdiçada.
  */
 static void gateway_task(void *arg)
 {
-    sx1262_t radio;
+    sx1262_t   radio;
     ssd1306_t *oled = NULL;
-    esp_err_t ret;
+    esp_err_t  ret;
 
-    /* Inicializa OLED */
+    /* ── Inicialização do display ────────────────────────────────── */
+    /* OLED é opcional — se falhar, continua só com log serial */
     ret = ssd1306_init(&oled);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "OLED init falhou: %s (continuando sem display)", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "OLED init falhou: %s (continuando sem display)",
+                 esp_err_to_name(ret));
     } else {
         ssd1306_clear(oled);
         ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
@@ -104,15 +138,16 @@ static void gateway_task(void *arg)
         ssd1306_update(oled);
     }
 
+    /* ── Inicialização do rádio LoRa ─────────────────────────────── */
     ret = sx1262_init(&radio);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha ao inicializar SX1262");
-        vTaskDelete(NULL);
+        vTaskDelete(NULL);   /* Sem rádio não há projeto */
         return;
     }
 
     ESP_LOGI(TAG, "=== LoRa Gateway (Requester) ===");
-    ESP_LOGI(TAG, "Pressione o botao PRG (GPIO0) para solicitar leitura");
+    ESP_LOGI(TAG, "Pressione PRG (GPIO0) para solicitar leitura do sensor");
 
     if (oled) {
         ssd1306_clear(oled);
@@ -122,15 +157,21 @@ static void gateway_task(void *arg)
         ssd1306_update(oled);
     }
 
+    /* ── Loop principal: aguarda botão → request → response → display ── */
     while (1) {
-        /* Aguarda pressionamento do botão */
+
+        /* Bloqueia até a ISR sinalizar que o botão foi pressionado.
+           portMAX_DELAY = espera infinita; sem CPU consumida. */
         if (xSemaphoreTake(s_btn_sem, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
-        /* Debounce simples */
+        /* ── Debounce ────────────────────────────────────────────── */
+        /* Botões mecânicos geram múltiplas bordas em poucos ms.
+           Esperamos 200ms e descartamos qualquer give() acumulado
+           durante esse intervalo, garantindo "1 press = 1 request". */
         vTaskDelay(pdMS_TO_TICKS(200));
-        xSemaphoreTake(s_btn_sem, 0);  /* Limpa presses extras */
+        xSemaphoreTake(s_btn_sem, 0);
 
         ESP_LOGI(TAG, "---------------------------------------");
         ESP_LOGI(TAG, "Botao pressionado! Enviando request...");
@@ -145,12 +186,21 @@ static void gateway_task(void *arg)
         }
         ESP_LOGI(TAG, "Request enviado [0x%02X 0x%02X]", request[0], request[1]);
 
-        /* ── Aguarda resposta do sensor ──────────────────────────── */
+        /* ── Aguarda resposta com timeout ────────────────────────── */
+        /* Após o TX, o SX1262 muda para RX. O nó sensor tem um delay
+           de 50ms antes de responder, então damos margem confortável. */
         ESP_LOGI(TAG, "Aguardando resposta (timeout %d ms)...", RX_TIMEOUT_MS);
 
         ret = sx1262_receive_packet(&radio, RX_TIMEOUT_MS);
         if (ret == ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "Timeout: sensor nao respondeu");
+            if (oled) {
+                ssd1306_clear(oled);
+                ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
+                ssd1306_draw_string(oled, 2, 0, "TIMEOUT");
+                ssd1306_draw_string(oled, 3, 0, "sem resposta");
+                ssd1306_update(oled);
+            }
             continue;
         }
         if (ret != ESP_OK) {
@@ -158,10 +208,10 @@ static void gateway_task(void *arg)
             continue;
         }
 
-        /* ── Lê e valida pacote de resposta ──────────────────────── */
+        /* ── Lê o pacote e captura RSSI ──────────────────────────── */
         uint8_t rx_data[LORA_MAX_PAYLOAD];
         uint8_t rx_len = 0;
-        int16_t rssi = 0;
+        int16_t rssi   = 0;
 
         ret = sx1262_read_packet(&radio, rx_data, &rx_len, &rssi);
         if (ret != ESP_OK) {
@@ -171,7 +221,11 @@ static void gateway_task(void *arg)
 
         ESP_LOGI(TAG, "Pacote recebido (%d bytes, RSSI: %d dBm)", rx_len, rssi);
 
-        /* Validação do formato */
+        /* ── Validação tripla: tamanho, header, checksum ─────────── */
+        /* Validações em sequência protegem contra: pacotes corrompidos
+           que passaram do CRC LoRa, ruído de RF que coincida com algum
+           pacote válido, ou outros devices LoRa na mesma frequência. */
+
         if (rx_len != RESPONSE_LEN) {
             ESP_LOGW(TAG, "Tamanho invalido: esperado %d, recebido %d",
                      RESPONSE_LEN, rx_len);
@@ -184,7 +238,6 @@ static void gateway_task(void *arg)
             continue;
         }
 
-        /* Validação do checksum XOR */
         uint8_t data_high = rx_data[1];
         uint8_t data_low  = rx_data[2];
         uint8_t checksum  = rx_data[3];
@@ -196,19 +249,21 @@ static void gateway_task(void *arg)
             continue;
         }
 
-        /* Extrai valor ADC de 12 bits */
-        uint16_t adc_value = ((uint16_t)data_high << 8) | data_low;
+        /* ── Reconstrói o valor de lux do sensor BH1750 ──────────── */
+        /* O nó sensor já fez a conversão raw / 1.2 antes de transmitir,
+           então o valor aqui é diretamente em lux (0 ~ 54612). */
+        uint16_t lux = ((uint16_t)data_high << 8) | data_low;
 
-        ESP_LOGI(TAG, ">>> Valor do sensor (LDR): %u  (0x%04X)", adc_value, adc_value);
+        ESP_LOGI(TAG, ">>> Luminosidade (BH1750): %u lux  (0x%04X)", lux, lux);
         ESP_LOGI(TAG, "    Pacote: [0x%02X 0x%02X 0x%02X 0x%02X] | RSSI: %d dBm",
                  rx_data[0], rx_data[1], rx_data[2], rx_data[3], rssi);
 
-        /* Atualiza OLED com dados recebidos */
+        /* ── Atualiza display com leitura recebida ───────────────── */
         if (oled) {
             char line[22];
             ssd1306_clear(oled);
             ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
-            snprintf(line, sizeof(line), "LDR: %u", adc_value);
+            snprintf(line, sizeof(line), "Lux: %u", lux);
             ssd1306_draw_string(oled, 2, 0, line);
             snprintf(line, sizeof(line), "RSSI: %d dBm", rssi);
             ssd1306_draw_string(oled, 3, 0, line);
@@ -219,18 +274,29 @@ static void gateway_task(void *arg)
         }
 
         /*
-         * No sistema final, aqui o gateway repassaria via UART para o FPGA:
-         *   UART TX → [0xAA, DATA_HIGH, DATA_LOW, CHECKSUM]
+         * TODO (próxima fase do roadmap):
+         * Encaminhar via UART para o FPGA o pacote validado:
+         *   uart_write_bytes(UART_NUM, rx_data, RESPONSE_LEN);
+         * O programa MIPS no FPGA, rodando sobre o SO preemptivo,
+         * vai ler dos endereços 1018 (status) e 1019 (data) já
+         * mapeados pelo UARTController.v.
          */
     }
 }
 
 /**
- * @brief Ponto de entrada da aplicacao.
+ * @brief Entry point da aplicação.
  *
- * Cria o semaforo binario para sincronizacao ISR→task,
- * inicializa o botao PRG e lanca a gateway_task no core 1
- * com 8 KB de stack (necessario para framebuffer OLED + SPI).
+ * Ordem de inicialização:
+ *  1. Cria o semáforo binário (não pode ser usado antes de criado)
+ *  2. Configura o botão e a ISR (já podemos receber presses)
+ *  3. Lança a task que consome do semáforo
+ *
+ * Stack de 8KB é generoso para:
+ *  - Framebuffer OLED (~1KB)
+ *  - Buffers SPI do SX1262 (~512B)
+ *  - Strings de log e printf (~512B)
+ *  - Margem para chamadas aninhadas (~6KB)
  */
 void app_main(void)
 {

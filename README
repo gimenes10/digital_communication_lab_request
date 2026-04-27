@@ -1,88 +1,81 @@
-# Digital Communication Lab - LoRa Request Node
+# Gateway LoRa (Requester)
 
-Projeto de laboratorio de comunicacoes digitais utilizando dois modulos
-Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262) para comunicacao LoRa
-request/response com leitura remota de sensor.
+Este é a outra metade do projeto da disciplina, o **gateway**. O par dele é o nó sensor com BH1750, que vive no projeto irmão `digital_communication_lab`.
 
-## Visao geral
+A função aqui é iniciar a conversa: pressionando o botão PRG, o gateway dispara uma requisição via LoRa, recebe a resposta com a leitura de luminosidade, e mostra o valor no OLED. Hoje o trigger é manual; futuramente vai vir do FPGA pela UART.
 
-Este firmware implementa o **no requisitante (gateway)** do sistema.
-Ao pressionar o botao PRG (GPIO0), o gateway envia um pacote LoRa de
-requisicao e aguarda a resposta do no sensor com o valor ADC de um LDR.
-O resultado e exibido no display OLED integrado e no log serial.
+## O que esse projeto faz
 
-## Protocolo
-
-| Direcao           | Formato                              |
-|--------------------|--------------------------------------|
-| Request (gateway)  | `[0xBB, 0x01]`                      |
-| Response (sensor)  | `[0xAA, DATA_HIGH, DATA_LOW, XOR]`  |
-
-- **XOR**: checksum = `DATA_HIGH ^ DATA_LOW`
-- **Valor ADC**: 12 bits, `(DATA_HIGH << 8) | DATA_LOW`
+Quando o gateway é ligado, ele inicializa o display, o rádio LoRa, e configura o botão PRG (GPIO0) com uma interrupção. Em seguida fica em standby esperando o usuário pressionar. No momento do pressionamento, monta o pacote `0xBB 0x01` e transmite por LoRa, depois muda imediatamente pra modo de recepção e espera a resposta do nó sensor por até cinco segundos. Se a resposta chega, ele valida o tamanho, o cabeçalho e o checksum XOR, e só então considera o dado bom — extrai o valor de lux e mostra no OLED junto com o RSSI. Se algum check falha ou se dá timeout, mostra o erro e volta a esperar o próximo botão.
 
 ## Hardware
 
-- **Placa**: Heltec WiFi LoRa 32 V3 / V3.1 (ESP32-S3)
-- **Radio LoRa**: SX1262 via SPI (915 MHz, SF7, BW125 kHz, CR4/5, +22 dBm)
-- **Display OLED**: SSD1306 128x64 via I2C (0x3C)
-- **Botao**: PRG / GPIO0 (ativo-baixo)
+A placa é a mesma do nó sensor — Heltec WiFi LoRa 32 V3, com ESP32-S3, SX1262 e OLED já integrados. A diferença é que aqui não tem nenhum sensor externo: este nó é só o "cabeça" da conversa LoRa. O botão usado é o PRG da própria placa, ligado no GPIO0, ativo-baixo. Isso é uma propriedade da placa Heltec — quando pressionado, o pino vai pra LOW, então a interrupção é configurada por borda de descida.
 
-### Pinagem
+## Protocolo
 
-| Funcao       | GPIO |
-|--------------|------|
-| SX1262 MOSI  | 10   |
-| SX1262 MISO  | 11   |
-| SX1262 SCK   | 9    |
-| SX1262 CS    | 8    |
-| SX1262 RST   | 12   |
-| SX1262 BUSY  | 13   |
-| SX1262 DIO1  | 14   |
-| OLED SDA     | 17   |
-| OLED SCL     | 18   |
-| OLED RST     | 21   |
-| OLED Vext    | 36   |
-| Botao PRG    | 0    |
+A conversa é a mesma definida no nó sensor. O gateway manda dois bytes (`0xBB 0x01`) e espera quatro bytes de volta (`0xAA HIGH LOW XOR`). O valor de lux é reconstituído juntando HIGH e LOW como um uint16, e o XOR é checado como sanity check.
 
-## Estrutura do projeto
+```
+Request:  [0xBB][0x01]
+Response: [0xAA][HIGH][LOW][XOR]
+```
+
+Vale repetir aqui o que está no README do sensor: o protocolo é agnóstico ao que tem do outro lado. Quando trocamos o LDR pelo BH1750, o gateway não foi tocado em nada — ele continua só recebendo 16 bits de dado e mostrando. Isso vai ser útil de novo quando este nó for adaptado pra repassar o pacote inteiro pra UART do FPGA: o programa em C- no MIPS também não vai precisar saber de qual sensor o dado veio.
+
+## Como funciona por dentro
+
+O design do código é todo em volta de evitar polling. Em vez de ficar lendo o estado do GPIO num loop, o sistema é organizado em três camadas que conversam por semáforo.
+
+A primeira camada é a interrupção. O GPIO0 está configurado como entrada com pull-up interno e interrupção por borda de descida. Toda vez que o usuário pressiona PRG, o hardware do ESP32 chama uma rotina de interrupção minúscula que está localizada em IRAM (memória interna instruções, garante execução mesmo se o cache de flash estiver desligado). A única coisa que essa ISR faz é dar `give()` num semáforo binário — três instruções no total, e ela retorna.
+
+A segunda camada é o semáforo. Ele funciona como uma campainha: a ISR toca, e quem está esperando é avisado. Enquanto ninguém toca, quem está esperando fica bloqueado, sem consumir CPU.
+
+A terceira camada é a task principal. Ela bloqueia em `xSemaphoreTake(s_btn_sem, portMAX_DELAY)` — o `portMAX_DELAY` quer dizer "espera pra sempre". Quando a campainha toca, a task acorda, processa o evento, e volta a bloquear. Resultado: zero ciclo de CPU desperdiçado em idle, e latência de resposta de microssegundos.
+
+Tem um detalhe importante de robustez: o debounce. Botões mecânicos ricocheteiam quando pressionados, gerando dezenas de transições em poucos milissegundos. Sem tratamento, um único toque do usuário viraria múltiplos requests LoRa. A solução é ler o semáforo, esperar 200 ms, e descartar qualquer give() acumulado nesse intervalo com um segundo `take()` não-bloqueante. Os 200 ms são tempo suficiente pra qualquer rebote terminar, e o resultado é uma garantia de "um toque, um request".
+
+Depois que o request foi enviado e o rádio está em modo de recepção, vem a parte mais defensiva do código — a validação tripla. Quando um pacote chega, antes de mostrar o valor pro usuário, três coisas são checadas em sequência:
+
+- O tamanho tem que ser exatamente quatro bytes; se for diferente, o pacote provavelmente é ruído de RF que casualmente decodificou como algo válido.
+- O primeiro byte tem que ser `0xAA`; se não for, é provável que seja outro device LoRa transmitindo na mesma frequência (915 MHz é uma faixa ISM, então tem outras coisas no ar).
+- E o quarto byte tem que bater com o XOR dos bytes 2 e 3; se não bate, algum bit foi virado no caminho e o CRC do LoRa deixou passar.
+
+Se alguma dessas três falha, o pacote é descartado e a task volta a esperar. Só passa adiante quando os três batem.
+
+A última coisa é a exibição. O lux é mostrado em três lugares: no log serial (`ESP_LOGI`), no OLED (linhas com lux, RSSI e os bytes raw em hex pra debug visual), e — futuramente — vai ser empurrado pra UART pra ser consumido pelo FPGA.
+
+## Como o código está organizado
 
 ```
 digital_communication_lab_request/
-├── main/
-│   ├── main.c              # Logica do gateway (botao, LoRa, OLED)
-│   └── CMakeLists.txt
 ├── components/
-│   ├── sx1262/              # Driver SX1262 LoRa (SPI)
-│   │   ├── sx1262.c
-│   │   └── include/sx1262.h
-│   └── ssd1306/             # Driver SSD1306 OLED (I2C)
-│       ├── ssd1306.c
-│       └── include/ssd1306.h
-├── CMakeLists.txt
-├── sdkconfig.defaults
-└── README
+│   ├── ssd1306/       ← driver do OLED
+│   └── sx1262/        ← driver do rádio LoRa
+├── main/
+│   └── main.c         ← lógica principal
+└── CMakeLists.txt
 ```
 
-## Requisitos
+Diferente do nó sensor, aqui não tem nenhum componente customizado: o gateway só usa OLED e LoRa. A task principal roda no Core 1, com 8 KB de stack — espaço bom pra acomodar o framebuffer do OLED (1 KB), os buffers SPI do SX1262 e margem pra chamadas aninhadas.
 
-- **ESP-IDF v6.0**
-- **Target**: esp32s3
-
-## Build e flash
+## Como rodar
 
 ```bash
 idf.py set-target esp32s3
 idf.py build
-idf.py -p COMx flash monitor
+idf.py -p COM_PORT flash monitor
 ```
 
-## Funcionamento
+Se tudo subiu certo, o log vai mostrar:
 
-1. Ao ligar, o gateway inicializa o OLED e o radio LoRa.
-2. O display mostra "Pressione PRG para ler sensor".
-3. Ao pressionar o botao PRG, o gateway:
-   - Envia `[0xBB, 0x01]` via LoRa.
-   - Aguarda resposta por 5 segundos.
-   - Valida header (0xAA), tamanho (4 bytes) e checksum XOR.
-   - Exibe valor do LDR e RSSI no OLED e no log serial.
+```
+I gateway: === LoRa Gateway (Requester) ===
+I gateway: Pressione PRG (GPIO0) para solicitar leitura do sensor
+```
+
+O OLED vai exibir "Pressione PRG / para ler sensor". Pressione o botão e em menos de um segundo deve aparecer a leitura de lux na tela.
+
+## Estado atual
+
+O gateway está pronto pra a parte de rádio: botão dispara request, valida resposta, mostra dado. O próximo passo é adicionar um driver UART aqui, pra que ao invés de só mostrar o lux no OLED, o gateway repasse o pacote validado pra um FPGA conectado por dois fios. Do lado do FPGA, o controlador UART em Verilog já está pronto e validado, e o que falta é o programa em C- que vai rodar no MIPS lendo dos endereços mapeados em memória.
