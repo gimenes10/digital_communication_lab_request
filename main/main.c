@@ -1,21 +1,16 @@
 /**
  * @file  main.c
- * @brief LoRa Gateway (Heltec #2) — Requester
- *
- * NÓ GATEWAY DO PIPELINE END-TO-END:
+ * @brief LoRa Gateway (Heltec #2) — Requester com forwarding UART para FPGA
  *
  *   ┌──────────────┐  LoRa req   ┌──────────────┐  LoRa resp  ┌──────────────┐  UART  ┌──────┐
  *   │  ESTE NÓ     │ ──────────> │  Sensor Node │ ──────────> │   ESTE NÓ    │ ─────> │ FPGA │
  *   │ (requester)  │             │  + BH1750    │             │ (re-recv)    │        │ MIPS │
  *   └──────────────┘             └──────────────┘             └──────────────┘        └──────┘
  *           ▲                                                          │
- *           │                                                          │
  *           └─── botão PRG dispara request ────────────────────────────┘
- *                (futuramente substituído por trigger automático
- *                 em intervalo regular ou comando do FPGA via UART)
  *
  * Comportamento:
- *   1. Inicializa OLED e SX1262
+ *   1. Inicializa OLED, SX1262 e UART para o FPGA
  *   2. Configura GPIO0 (botão PRG) como interrupção por borda de descida
  *   3. Aguarda pressionamento via semáforo binário (ISR → task)
  *   4. Ao pressionar:
@@ -23,9 +18,22 @@
  *        b. Transmite [0xBB, 0x01] via LoRa
  *        c. Entra em RX com timeout de 5s aguardando resposta
  *        d. Valida tamanho, header e checksum XOR
- *        e. Extrai lux (uint16) e mostra no OLED + log serial
+ *        e. Mostra lux no OLED + log serial
+ *        f. Encaminha o pacote completo [0xAA HIGH LOW XOR] via UART para o FPGA
  *   5. Volta a aguardar próximo pressionamento
  *
+ * UART → FPGA:
+ *   - Baud: 9600 (compatível com UARTController.v no FPGA)
+ *   - Pinos: TX=GPIO 43, RX=GPIO 44
+ *   - O pacote enviado é EXATAMENTE o que veio por LoRa, byte por byte:
+ *     o FPGA tem seu próprio parser que valida o XOR de novo.
+ *
+ * GATILHO REMOTO PELO FPGA (KEY2):
+ *   - Quando KEY2 é pressionado na DE2-115, o FPGA envia o byte 0xCC
+ *     pela UART. Uma task aqui (fpga_listener_task) escuta o RX,
+ *     detecta esse byte e dispara o mesmo semáforo que o ISR do PRG
+ *     dispara — acionando o ciclo de request LoRa exatamente igual
+ *     a um aperto manual.
  *
  * Plataforma: Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
  * Framework:  ESP-IDF v6.0
@@ -37,6 +45,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "sx1262.h"
 #include "ssd1306.h"
@@ -44,32 +53,36 @@
 static const char *TAG = "gateway";
 
 /* ── Protocolo Request/Response ──────────────────────────────────── */
-/* Formato idêntico ao do nó sensor — protocolo agnóstico ao sensor   */
-/* físico do outro lado (LDR, BH1750, qualquer um cabe em uint16).    */
-#define HEADER_REQUEST   0xBB    /* Byte 0 do request                  */
-#define CMD_READ_SENSOR  0x01    /* Byte 1: comando "ler sensor"       */
-#define HEADER_RESPONSE  0xAA    /* Byte 0 esperado na resposta        */
+#define HEADER_REQUEST   0xBB
+#define CMD_READ_SENSOR  0x01
+#define HEADER_RESPONSE  0xAA
 #define RESPONSE_LEN     4       /* [HEADER, HIGH, LOW, XOR]           */
 
-/* ── Hardware ────────────────────────────────────────────────────── */
+/* ── Botão de trigger ────────────────────────────────────────────── */
 #define BUTTON_GPIO      GPIO_NUM_0   /* Botão PRG do Heltec V3        */
 #define RX_TIMEOUT_MS    5000         /* Sensor deve responder em <5s  */
 
+/* ── UART para o FPGA ────────────────────────────────────────────── */
+/* UART_NUM_1 (não conflita com UART_NUM_0 que é o console USB).
+ * Pinos escolhidos: GPIO 43 e 44. Estão livres no Heltec V3 e não
+ * conflitam com SX1262 (8-14), OLED (17/18/21) ou Vext (36).      */
+#define FPGA_UART_NUM    UART_NUM_1
+#define FPGA_UART_TX     GPIO_NUM_43
+#define FPGA_UART_RX     GPIO_NUM_44
+#define FPGA_UART_BAUD   9600
+#define FPGA_UART_BUF    256   /* Buffer interno do driver UART      */
+
+/* Comando vindo do FPGA pelo RX da UART:
+ * 0xCC é enviado pelo top.v quando KEY2 é pressionado.
+ * Distinto de 0xAA/0xBB do protocolo LoRa para evitar ambiguidade. */
+#define FPGA_UART_CMD_TRIGGER  0xCC
+
 /* ── Sincronização ISR → Task ────────────────────────────────────── */
-/* Semáforo binário: a ISR dá give() a cada borda, a task espera      */
-/* indefinidamente em take(). Evita polling do GPIO no loop principal. */
 static SemaphoreHandle_t s_btn_sem;
 
 /**
  * @brief ISR do botão PRG (GPIO0).
- *
- * Atributo IRAM_ATTR é obrigatório: ISRs são executadas com cache de
- * flash potencialmente desativado, então precisam estar em IRAM.
- *
- * O semáforo é dado de dentro da ISR via xSemaphoreGiveFromISR para
- * acordar a task. Se o give() resultou em uma task de prioridade
- * maior que a interrompida, portYIELD_FROM_ISR força um context
- * switch ao retornar, ao invés de esperar o próximo tick.
+ * IRAM_ATTR é obrigatório pois ISRs rodam mesmo com cache de flash off.
  */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
@@ -80,15 +93,6 @@ static void IRAM_ATTR button_isr_handler(void *arg)
 
 /**
  * @brief Configura GPIO0 como entrada com pull-up + IRQ neg-edge.
- *
- * O botão PRG é ativo-baixo: pull-up interno mantém HIGH em idle,
- * e o pressionamento força LOW. Por isso a interrupção é por borda
- * de descida (NEGEDGE).
- *
- * gpio_install_isr_service(0):
- *   - O argumento 0 indica que não queremos flags especiais (ESP_INTR_FLAG_*)
- *   - Pode retornar ESP_ERR_INVALID_STATE se outra parte do código já
- *     instalou o serviço — não é erro, ignoramos.
  */
 static esp_err_t button_init(void)
 {
@@ -110,14 +114,59 @@ static esp_err_t button_init(void)
 }
 
 /**
+ * @brief Inicializa UART para forwarding ao FPGA.
+ *
+ * Configuração: 9600 baud, 8 bits, sem paridade, 1 stop bit (8N1).
+ * Esses parâmetros precisam casar com o UARTController.v do FPGA:
+ * o módulo Verilog assume 8N1 e o baud rate é parametrizado lá em
+ * 9600 também (vide top.v: BAUD_RATE(9600)).
+ *
+ * RX é ligado mas não usado nesta fase — fica preparado pra quando
+ * o FPGA mandar comandos de volta no futuro.
+ */
+static esp_err_t fpga_uart_init(void)
+{
+    esp_err_t ret;
+
+    uart_config_t cfg = {
+        .baud_rate = FPGA_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ret = uart_driver_install(FPGA_UART_NUM, FPGA_UART_BUF, FPGA_UART_BUF,
+                              0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_driver_install falhou: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = uart_param_config(FPGA_UART_NUM, &cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_param_config falhou: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* UART_PIN_NO_CHANGE para os pinos não usados (RTS/CTS) */
+    ret = uart_set_pin(FPGA_UART_NUM, FPGA_UART_TX, FPGA_UART_RX,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_set_pin falhou: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "UART para FPGA: TX=%d, RX=%d, %d baud, 8N1",
+             FPGA_UART_TX, FPGA_UART_RX, FPGA_UART_BAUD);
+    return ESP_OK;
+}
+
+/**
  * @brief Task principal do gateway LoRa.
  *
  * Roda no Core 1 (deixa Core 0 para o stack WiFi/BT, se ativados).
- * Stack de 8KB acomoda o framebuffer do OLED (1KB), buffers SPI do
- * SX1262 e variáveis locais com folga.
- *
- * O loop é totalmente event-driven: bloqueia em xSemaphoreTake até
- * o botão ser pressionado. Sem polling = sem CPU desperdiçada.
  */
 static void gateway_task(void *arg)
 {
@@ -126,7 +175,6 @@ static void gateway_task(void *arg)
     esp_err_t  ret;
 
     /* ── Inicialização do display ────────────────────────────────── */
-    /* OLED é opcional — se falhar, continua só com log serial */
     ret = ssd1306_init(&oled);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "OLED init falhou: %s (continuando sem display)",
@@ -136,6 +184,14 @@ static void gateway_task(void *arg)
         ssd1306_draw_string(oled, 0, 0, "LoRa Gateway");
         ssd1306_draw_string(oled, 2, 0, "Aguardando...");
         ssd1306_update(oled);
+    }
+
+    /* ── Inicialização do UART para FPGA ─────────────────────────── */
+    /* Não-fatal se falhar: o gateway continua funcionando, só não
+       encaminha pro FPGA. Loga warning e segue. */
+    ret = fpga_uart_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "UART FPGA falhou — operando sem forwarding");
     }
 
     /* ── Inicialização do rádio LoRa ─────────────────────────────── */
@@ -157,26 +213,22 @@ static void gateway_task(void *arg)
         ssd1306_update(oled);
     }
 
-    /* ── Loop principal: aguarda botão → request → response → display ── */
+    /* ── Loop principal: aguarda botão → request → response → forward ── */
     while (1) {
 
-        /* Bloqueia até a ISR sinalizar que o botão foi pressionado.
-           portMAX_DELAY = espera infinita; sem CPU consumida. */
+        /* Bloqueia até a ISR sinalizar que o botão foi pressionado. */
         if (xSemaphoreTake(s_btn_sem, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
         /* ── Debounce ────────────────────────────────────────────── */
-        /* Botões mecânicos geram múltiplas bordas em poucos ms.
-           Esperamos 200ms e descartamos qualquer give() acumulado
-           durante esse intervalo, garantindo "1 press = 1 request". */
         vTaskDelay(pdMS_TO_TICKS(200));
         xSemaphoreTake(s_btn_sem, 0);
 
         ESP_LOGI(TAG, "---------------------------------------");
         ESP_LOGI(TAG, "Botao pressionado! Enviando request...");
 
-        /* ── Monta e envia pacote de requisição ──────────────────── */
+        /* ── Monta e envia pacote de requisição via LoRa ─────────── */
         uint8_t request[] = { HEADER_REQUEST, CMD_READ_SENSOR };
 
         ret = sx1262_send_packet(&radio, request, sizeof(request));
@@ -187,8 +239,6 @@ static void gateway_task(void *arg)
         ESP_LOGI(TAG, "Request enviado [0x%02X 0x%02X]", request[0], request[1]);
 
         /* ── Aguarda resposta com timeout ────────────────────────── */
-        /* Após o TX, o SX1262 muda para RX. O nó sensor tem um delay
-           de 50ms antes de responder, então damos margem confortável. */
         ESP_LOGI(TAG, "Aguardando resposta (timeout %d ms)...", RX_TIMEOUT_MS);
 
         ret = sx1262_receive_packet(&radio, RX_TIMEOUT_MS);
@@ -222,10 +272,6 @@ static void gateway_task(void *arg)
         ESP_LOGI(TAG, "Pacote recebido (%d bytes, RSSI: %d dBm)", rx_len, rssi);
 
         /* ── Validação tripla: tamanho, header, checksum ─────────── */
-        /* Validações em sequência protegem contra: pacotes corrompidos
-           que passaram do CRC LoRa, ruído de RF que coincida com algum
-           pacote válido, ou outros devices LoRa na mesma frequência. */
-
         if (rx_len != RESPONSE_LEN) {
             ESP_LOGW(TAG, "Tamanho invalido: esperado %d, recebido %d",
                      RESPONSE_LEN, rx_len);
@@ -249,14 +295,24 @@ static void gateway_task(void *arg)
             continue;
         }
 
-        /* ── Reconstrói o valor de lux do sensor BH1750 ──────────── */
-        /* O nó sensor já fez a conversão raw / 1.2 antes de transmitir,
-           então o valor aqui é diretamente em lux (0 ~ 54612). */
+        /* ── Reconstrói o valor de lux (BH1750) ──────────────────── */
         uint16_t lux = ((uint16_t)data_high << 8) | data_low;
 
         ESP_LOGI(TAG, ">>> Luminosidade (BH1750): %u lux  (0x%04X)", lux, lux);
         ESP_LOGI(TAG, "    Pacote: [0x%02X 0x%02X 0x%02X 0x%02X] | RSSI: %d dBm",
                  rx_data[0], rx_data[1], rx_data[2], rx_data[3], rssi);
+
+        /* ── Encaminha pacote para o FPGA via UART ──────────────── */
+        /* Repassa os 4 bytes EXATAMENTE como vieram. O FPGA tem seu
+           próprio parser que valida o XOR de novo, então mesmo se este
+           gateway fosse bypassed, o FPGA ainda detectaria erros. */
+        int written = uart_write_bytes(FPGA_UART_NUM,
+                                       (const char *)rx_data, RESPONSE_LEN);
+        if (written == RESPONSE_LEN) {
+            ESP_LOGI(TAG, "    Encaminhado para FPGA via UART (%d bytes)", written);
+        } else {
+            ESP_LOGW(TAG, "    UART write incompleto: %d/%d bytes", written, RESPONSE_LEN);
+        }
 
         /* ── Atualiza display com leitura recebida ───────────────── */
         if (oled) {
@@ -270,33 +326,57 @@ static void gateway_task(void *arg)
             snprintf(line, sizeof(line), "[%02X %02X %02X %02X]",
                      rx_data[0], rx_data[1], rx_data[2], rx_data[3]);
             ssd1306_draw_string(oled, 5, 0, line);
+            ssd1306_draw_string(oled, 7, 0, "-> FPGA OK");
             ssd1306_update(oled);
         }
+    }
+}
 
-        /*
-         * TODO (próxima fase do roadmap):
-         * Encaminhar via UART para o FPGA o pacote validado:
-         *   uart_write_bytes(UART_NUM, rx_data, RESPONSE_LEN);
-         * O programa MIPS no FPGA, rodando sobre o SO preemptivo,
-         * vai ler dos endereços 1018 (status) e 1019 (data) já
-         * mapeados pelo UARTController.v.
-         */
+/**
+ * @brief Task que escuta a UART do FPGA e dispara o semáforo
+ *        ao receber o byte 0xCC (comando "trigger request").
+ *
+ * Roda em paralelo com gateway_task: enquanto a gateway_task fica
+ * bloqueada no semáforo, esta task fica bloqueada no uart_read_bytes.
+ * Ambas são produtoras do mesmo sinal (semáforo), do ponto de vista
+ * da gateway_task não há diferença entre um aperto de PRG e um 0xCC
+ * vindo do FPGA.
+ *
+ * Por que polling em vez de interrupção?
+ *   - O driver UART do ESP-IDF já implementa buffering interno.
+ *     uart_read_bytes bloqueia eficientemente sem consumir CPU.
+ *   - Configurar IRQ direto seria mais código, sem benefício aqui:
+ *     a latência de alguns ms não impacta o caso de uso.
+ *
+ * Bytes diferentes de 0xCC são ignorados — protege contra ruído na
+ * linha quando o FPGA está sendo ligado/desligado.
+ */
+static void fpga_listener_task(void *arg)
+{
+    uint8_t rx_byte;
+
+    ESP_LOGI(TAG, "FPGA listener iniciado: aguardando 0xCC no RX");
+
+    while (1) {
+        /* Bloqueia indefinidamente até chegar 1 byte. portMAX_DELAY
+           impede polling ativo — a task fica em estado blocked. */
+        int n = uart_read_bytes(FPGA_UART_NUM, &rx_byte, 1, portMAX_DELAY);
+        if (n != 1) {
+            continue;
+        }
+
+        if (rx_byte == FPGA_UART_CMD_TRIGGER) {
+            ESP_LOGI(TAG, "<<< KEY2 do FPGA detectado (0xCC) — disparando request");
+            /* Mesmo efeito do ISR do botão PRG: acorda a gateway_task. */
+            xSemaphoreGive(s_btn_sem);
+        } else {
+            ESP_LOGW(TAG, "Byte UART desconhecido: 0x%02X (ignorado)", rx_byte);
+        }
     }
 }
 
 /**
  * @brief Entry point da aplicação.
- *
- * Ordem de inicialização:
- *  1. Cria o semáforo binário (não pode ser usado antes de criado)
- *  2. Configura o botão e a ISR (já podemos receber presses)
- *  3. Lança a task que consome do semáforo
- *
- * Stack de 8KB é generoso para:
- *  - Framebuffer OLED (~1KB)
- *  - Buffers SPI do SX1262 (~512B)
- *  - Strings de log e printf (~512B)
- *  - Margem para chamadas aninhadas (~6KB)
  */
 void app_main(void)
 {
@@ -308,5 +388,11 @@ void app_main(void)
         return;
     }
 
+    /* gateway_task: a tarefa principal (request LoRa + forwarding) */
     xTaskCreatePinnedToCore(gateway_task, "gateway", 8192, NULL, 5, NULL, 1);
+
+    /* fpga_listener_task: escuta a UART vinda do FPGA.
+       Stack menor pois só faz uart_read + give de semáforo.
+       Prioridade igual à da gateway_task: o semáforo dá a sincronização. */
+    xTaskCreatePinnedToCore(fpga_listener_task, "fpga_lst", 3072, NULL, 5, NULL, 1);
 }
