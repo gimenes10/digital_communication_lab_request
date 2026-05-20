@@ -24,7 +24,7 @@
  *
  * UART → FPGA:
  *   - Baud: 9600 (compatível com UARTController.v no FPGA)
- *   - Pinos: TX=GPIO 43, RX=GPIO 44
+ *   - Pinos: TX=GPIO 19, RX=GPIO 20 (43/44 são console UART0 do S3)
  *   - O pacote enviado é EXATAMENTE o que veio por LoRa, byte por byte:
  *     o FPGA tem seu próprio parser que valida o XOR de novo.
  *
@@ -63,19 +63,20 @@ static const char *TAG = "gateway";
 #define RX_TIMEOUT_MS    5000         /* Sensor deve responder em <5s  */
 
 /* ── UART para o FPGA ────────────────────────────────────────────── */
-/* UART_NUM_1 (não conflita com UART_NUM_0 que é o console USB).
- * Pinos escolhidos: GPIO 43 e 44. Estão livres no Heltec V3 e não
- * conflitam com SX1262 (8-14), OLED (17/18/21) ou Vext (36).      */
+/* UART_NUM_1 a 9600 baud, 8N1.
+ *
+ * Pinos: usei GPIO 19 e 20. Evitei 43/44 porque no ESP32-S3 esses
+ * pinos são o console UART0 — conflito direto, ESP crashava no boot. */
 #define FPGA_UART_NUM    UART_NUM_1
-#define FPGA_UART_TX     GPIO_NUM_43
-#define FPGA_UART_RX     GPIO_NUM_44
+#define FPGA_UART_TX     GPIO_NUM_19
+#define FPGA_UART_RX     GPIO_NUM_20
 #define FPGA_UART_BAUD   9600
-#define FPGA_UART_BUF    256   /* Buffer interno do driver UART      */
+#define FPGA_UART_BUF    256
 
-/* Comando vindo do FPGA pelo RX da UART:
- * 0xCC é enviado pelo top.v quando KEY2 é pressionado.
- * Distinto de 0xAA/0xBB do protocolo LoRa para evitar ambiguidade. */
-#define FPGA_UART_CMD_TRIGGER  0xCC
+/* Byte que o FPGA manda pelo KEY2. Distinto dos bytes do protocolo LoRa
+ * (0xAA = response, 0xBB = request) pra não ter ambiguidade. */
+
+ #define FPGA_UART_CMD_TRIGGER  0xCC
 
 /* ── Sincronização ISR → Task ────────────────────────────────────── */
 static SemaphoreHandle_t s_btn_sem;
@@ -114,15 +115,15 @@ static esp_err_t button_init(void)
 }
 
 /**
- * @brief Inicializa UART para forwarding ao FPGA.
+ * Inicializa a UART_NUM_1 a 9600 8N1 nos pinos FPGA_UART_TX/RX.
  *
- * Configuração: 9600 baud, 8 bits, sem paridade, 1 stop bit (8N1).
- * Esses parâmetros precisam casar com o UARTController.v do FPGA:
- * o módulo Verilog assume 8N1 e o baud rate é parametrizado lá em
- * 9600 também (vide top.v: BAUD_RATE(9600)).
+ * Ordem dos passos importa na ESP-IDF v6.0:
+ *   1º param_config
+ *   2º set_pin
+ *   3º driver_install
  *
- * RX é ligado mas não usado nesta fase — fica preparado pra quando
- * o FPGA mandar comandos de volta no futuro.
+ * E atenção aos parâmetros do install: a ordem é (port, RX_buf, TX_buf,
+ * queue_size, queue, flags). Inverter dá erro no driver.
  */
 static esp_err_t fpga_uart_init(void)
 {
@@ -137,24 +138,32 @@ static esp_err_t fpga_uart_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ret = uart_driver_install(FPGA_UART_NUM, FPGA_UART_BUF, FPGA_UART_BUF,
-                              0, NULL, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install falhou: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
+    /* 1. Configura parâmetros */
     ret = uart_param_config(FPGA_UART_NUM, &cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "uart_param_config falhou: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    /* UART_PIN_NO_CHANGE para os pinos não usados (RTS/CTS) */
+    /* 2. Atribui pinos (RTS/CTS sem mudança) */
     ret = uart_set_pin(FPGA_UART_NUM, FPGA_UART_TX, FPGA_UART_RX,
                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "uart_set_pin falhou: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* 3. Instala o driver.
+       ORDEM CORRETA dos parâmetros: (port, RX_buf, TX_buf, queue_size, queue, flags)
+       - RX_buf = 256 (>= UART_HW_FIFO_LEN=128)
+       - TX_buf = 0   (escritas bloqueiam até sair, sem buffer extra; OK para 4 bytes)
+       - queue_size = 0 e queue = NULL: não queremos eventos. */
+    ret = uart_driver_install(FPGA_UART_NUM,
+                              FPGA_UART_BUF,    /* RX */
+                              0,                /* TX */
+                              0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uart_driver_install falhou: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -186,15 +195,10 @@ static void gateway_task(void *arg)
         ssd1306_update(oled);
     }
 
-    /* ── Inicialização do UART para FPGA ─────────────────────────── */
-    /* Não-fatal se falhar: o gateway continua funcionando, só não
-       encaminha pro FPGA. Loga warning e segue. */
-    ret = fpga_uart_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "UART FPGA falhou — operando sem forwarding");
-    }
-
     /* ── Inicialização do rádio LoRa ─────────────────────────────── */
+    /* OBS: a UART para o FPGA já foi inicializada no app_main, antes
+       das tasks serem criadas — caso contrário a fpga_listener_task
+       começaria chamando uart_read_bytes em um driver não instalado. */
     ret = sx1262_init(&radio);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha ao inicializar SX1262");
@@ -333,23 +337,12 @@ static void gateway_task(void *arg)
 }
 
 /**
- * @brief Task que escuta a UART do FPGA e dispara o semáforo
- *        ao receber o byte 0xCC (comando "trigger request").
+ * Task que escuta a UART do FPGA. Ao receber 0xCC, dá give no semáforo
+ * (mesmo que o ISR do PRG faria), então o ciclo LoRa dispara igual a
+ * um aperto manual.
  *
- * Roda em paralelo com gateway_task: enquanto a gateway_task fica
- * bloqueada no semáforo, esta task fica bloqueada no uart_read_bytes.
- * Ambas são produtoras do mesmo sinal (semáforo), do ponto de vista
- * da gateway_task não há diferença entre um aperto de PRG e um 0xCC
- * vindo do FPGA.
- *
- * Por que polling em vez de interrupção?
- *   - O driver UART do ESP-IDF já implementa buffering interno.
- *     uart_read_bytes bloqueia eficientemente sem consumir CPU.
- *   - Configurar IRQ direto seria mais código, sem benefício aqui:
- *     a latência de alguns ms não impacta o caso de uso.
- *
- * Bytes diferentes de 0xCC são ignorados — protege contra ruído na
- * linha quando o FPGA está sendo ligado/desligado.
+ * Uso timeout curto no uart_read_bytes em vez de portMAX_DELAY: com
+ * espera infinita o driver da v6.0 dava erro em loop, com 100ms não.
  */
 static void fpga_listener_task(void *arg)
 {
@@ -358,11 +351,12 @@ static void fpga_listener_task(void *arg)
     ESP_LOGI(TAG, "FPGA listener iniciado: aguardando 0xCC no RX");
 
     while (1) {
-        /* Bloqueia indefinidamente até chegar 1 byte. portMAX_DELAY
-           impede polling ativo — a task fica em estado blocked. */
-        int n = uart_read_bytes(FPGA_UART_NUM, &rx_byte, 1, portMAX_DELAY);
-        if (n != 1) {
-            continue;
+        /* Lê com timeout curto. uart_read_bytes retorna 0 quando não tem
+           dados (não é erro). A task fica eficientemente bloqueada no
+           driver durante esses 100ms. */
+        int n = uart_read_bytes(FPGA_UART_NUM, &rx_byte, 1, pdMS_TO_TICKS(100));
+        if (n <= 0) {
+            continue;  /* timeout normal, sem byte — volta a esperar */
         }
 
         if (rx_byte == FPGA_UART_CMD_TRIGGER) {
@@ -385,6 +379,17 @@ void app_main(void)
     esp_err_t ret = button_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha ao configurar botao: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    /* IMPORTANTE: inicializar a UART ANTES de criar as tasks, para que
+       a fpga_listener_task não comece chamando uart_read_bytes em um
+       driver ainda não instalado (causa erros de driver em loop). */
+    ret = fpga_uart_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "UART FPGA falhou — operando sem forwarding");
+        /* Não cria a fpga_listener_task se a UART falhou. */
+        xTaskCreatePinnedToCore(gateway_task, "gateway", 8192, NULL, 5, NULL, 1);
         return;
     }
 
